@@ -1,0 +1,47 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"minipi/internal/llm"
+	"time"
+)
+
+var getTimeSpec = llm.ToolSpec{
+	Name:        "get_time",
+	Description: "Returns the current local time in RFC3339 format.",
+	InputSchema: map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	},
+}
+
+// executeTools 执行一轮的全部工具调用，为每个调用追加一条 toolResult。
+//
+// ⚠️ Day 2 临时实现（stub）：
+//   - "描述"(ToolSpecs，数据) 与 "执行"(runTool，硬编码 switch) 割裂
+//   - 顺序执行；Day 3 换成 errgroup 并行 + Registry 查找
+func executeTools(ctx context.Context, st *AgentState, calls []llm.ToolCall) {
+	for _, call := range calls {
+		result := runTool(ctx, call)
+		st.Messages = append(st.Messages, llm.Message{
+			Role:       llm.RoleToolResult,
+			Content:    result,
+			ToolCallID: call.ID, // 回指 assistant 的调用 ID，Provider 靠它配对
+		})
+	}
+}
+
+func runTool(ctx context.Context, call llm.ToolCall) string {
+	if err := ctx.Err(); err != nil {
+		return "error: canceled"
+	}
+	switch call.Name {
+	case "get_time":
+		return time.Now().Format(time.RFC3339)
+	default:
+		// 种子原则：未知工具/失败都作为结果回喂（而非中断循环），
+		// 模型看到 error 文本可自我纠正 —— Day 3 正式确立
+		return fmt.Sprintf("error: unknown tool %q", call.Name)
+	}
+}
