@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"minipi/internal/llm"
+	"strings"
 	"testing"
 	"time"
 )
@@ -131,9 +132,17 @@ func TestRunMaxSteps(t *testing.T) {
 	if len(m.Calls) != 3 {
 		t.Errorf("model calls = %d, want 3", len(m.Calls))
 	}
-	// 1 user + 3×(assistant + toolResult) = 7
-	if len(st.Messages) != 7 {
-		t.Errorf("messages = %d, want 7", len(st.Messages))
+	// 1 user + 3×(assistant + toolResult) + 1 UINote = 8
+	if len(st.Messages) != 8 {
+		t.Errorf("messages = %d, want 8", len(st.Messages))
+	}
+	// Day 4 新增断言：末尾是 UI-only 注释，且它不会进入模型视图
+	last := st.Messages[len(st.Messages)-1]
+	if !last.Hidden {
+		t.Errorf("last message should be a hidden UI note, got %+v", last.Message)
+	}
+	if !strings.Contains(last.Content, "max steps") {
+		t.Errorf("note content = %q", last.Content)
 	}
 }
 

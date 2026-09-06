@@ -48,7 +48,7 @@ func TestParallelTools(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	var pairs []llm.Message
+	var pairs []Message
 	for _, msg := range msgs {
 		if msg.Role == llm.RoleToolResult {
 			pairs = append(pairs, msg)

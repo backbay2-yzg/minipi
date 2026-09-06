@@ -50,6 +50,8 @@ func main() {
 			agent.NewTimeTool(),
 			agent.NewCalcTool(),
 		),
+		// ★ Day 4：滑动窗口。教学期建议先设 2，肉眼观察裁剪生效后再调大
+		Transforms: []agent.TransformFunc{agent.PruneByTurns(2)},
 	}
 
 	fmt.Printf("mini-pi day2 | provider=%s model=%s\n", provider, model)
@@ -82,6 +84,7 @@ func main() {
 		// 事务式回滚：记住本轮起点，失败则截断回起点。
 		// 避免半截轮次污染历史（Anthropic 要求 user/assistant 交替）
 		turnStart := len(st.Messages)
+		inBefore := st.TotalUsage.InputTokens // ★ 记录本轮起点，算每轮增量
 
 		msgs, err := agent.Run(ctx, st, line)
 		if err != nil {
@@ -92,14 +95,15 @@ func main() {
 
 		// 正常出口的最后一条消息必是 assistant
 		fmt.Println(msgs[len(msgs)-1].Content)
-		fmt.Printf("  [usage] total in=%d out=%d\n",
-			st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
 
 		for _, m := range msgs[turnStart:] {
 			if m.Role == llm.RoleToolResult {
 				fmt.Printf("  [tool %s] %s\n", m.ToolCallID, m.Content)
 			}
 		}
+		fmt.Printf("  [usage] turn in=%d | total in=%d out=%d\n",
+			st.TotalUsage.InputTokens-inBefore,
+			st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
 	}
 }
 

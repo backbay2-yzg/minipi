@@ -20,7 +20,7 @@ import (
 //  3. 取消传播：gctx 随父 ctx 取消（用户 Ctrl+C → 进行中的工具 HTTP 调用中断）
 func executeTools(ctx context.Context, st *AgentState, calls []llm.ToolCall) {
 	g, gctx := errgroup.WithContext(ctx)
-	results := make([]llm.Message, len(calls))
+	results := make([]Message, len(calls))
 	for i, call := range calls {
 		// Go 1.22+ 循环变量每轮新建，此行可省；保留以示兼容老版本
 		i, call := i, call
@@ -39,7 +39,7 @@ func executeTools(ctx context.Context, st *AgentState, calls []llm.ToolCall) {
 // 工具内部任何形态的失败（error / panic / ctx 取消）都被折叠进
 // 结果文本，保证每一条 toolCall 恰好得到一条 toolResult ——
 // 这是与 Provider 配对的硬协议，破坏即 400。
-func runOne(ctx context.Context, reg *Registry, call llm.ToolCall) llm.Message {
+func runOne(ctx context.Context, reg *Registry, call llm.ToolCall) Message {
 	out := func() (out string) {
 		// 工具是外部代码的边界：panic 不允许炸穿整个 Agent
 		defer func() {
@@ -68,9 +68,5 @@ func runOne(ctx context.Context, reg *Registry, call llm.ToolCall) llm.Message {
 		return res
 	}()
 
-	return llm.Message{
-		Role:       llm.RoleToolResult,
-		ToolCallID: call.ID, // 与 assistant 的调用 ID 配对，Provider 靠它对账
-		Content:    out,
-	}
+	return ToolResultMsg(call.ID, out) // ★ 唯一变化：构造函数（自动带 CreatedAt）
 }

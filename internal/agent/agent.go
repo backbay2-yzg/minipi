@@ -24,7 +24,11 @@ type AgentState struct {
 	Tools    *Registry
 	MaxSteps int // 0 表示用 DefaultMaxSteps
 
-	Messages   []llm.Message  // 对话历史（含中间的 tool 轮次）
+	// Transforms 是 Context 管道第一级（Day 4），按序执行。
+	// nil/空 = 不裁剪，全量历史直发 —— 小对话的正确选择。
+	Transforms []TransformFunc
+
+	Messages   []Message      // 对话历史（含中间的 tool 轮次）
 	TotalUsage llm.TokenUsage // 累计 token 消耗：循环顺带收集的遥测
 }
 
@@ -36,7 +40,7 @@ type AgentState struct {
 //
 // ⚠️ 返回切片与 st.Messages 共享底层数组：调用方只读，切勿 append/修改。
 // （Day 6 引入 Session 持久化时会加显式快照）
-func Run(ctx context.Context, st *AgentState, input string) ([]llm.Message, error) {
+func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 	if st.Model == nil {
 		return st.Messages, errors.New("agent: nil model")
 	}
@@ -46,26 +50,29 @@ func Run(ctx context.Context, st *AgentState, input string) ([]llm.Message, erro
 		maxSteps = DefaultMaxStep
 	}
 	// ① 用户输入历史
-	st.Messages = append(st.Messages, llm.Message{
-		Role:    llm.RoleUser,
-		Content: input,
-	})
+	st.Messages = append(st.Messages, UserMsg(input))
+
+	var specs []llm.ToolSpec
+	if st.Tools != nil {
+		specs = st.Tools.Specs()
+	}
 
 	// ② 核心循环
 	for step := 0; step < maxSteps; step++ {
-		// 2.1 每轮先查取消。真实 Model 的 HTTP 层也会查 ctx，
-		// 这里是第二道防线（Day 3 的工具执行也会查）
 		if err := ctx.Err(); err != nil {
 			return st.Messages, fmt.Errorf("agent: step %d: %w", step, err)
+
 		}
 
-		var specs []llm.ToolSpec
-		if st.Tools != nil {
-			specs = st.Tools.Specs()
+		// 2.1 ★ Day 4 核心：全量历史 → 两级管道 → 本次请求的视图
+		view, err := st.buildView(ctx)
+		if err != nil {
+			return st.Messages, fmt.Errorf("agent: step %d: build view: %w", step, err)
 		}
-		// 2.2 调模型：全部历史 + 工具声明
+
+		// 2.2 调模型：发送视图（不是 st.Messages 本体）
 		out, err := st.Model.Complete(ctx, llm.CompletionRequest{
-			Messages: st.Messages,
+			Messages: view, // ★ 组装点：视图，非全量
 			System:   st.SystemPrompt,
 			Tools:    specs,
 		})
@@ -78,11 +85,7 @@ func Run(ctx context.Context, st *AgentState, input string) ([]llm.Message, erro
 
 		// 2.3 assistant 回复（含可能的工具调用请求）入历史。
 		// 即使要走工具分支也先入历史——Provider 靠它和 toolResult 配对
-		st.Messages = append(st.Messages, llm.Message{
-			Role:      llm.RoleAssistant,
-			Content:   out.Text,
-			ToolCalls: out.ToolCalls,
-		})
+		st.Messages = append(st.Messages, AssistantMsg(out.Text, out.ToolCalls))
 
 		// 2.4 正常出口：模型没有请求工具 → 最终答案已产生
 		if len(out.ToolCalls) == 0 {
@@ -91,6 +94,21 @@ func Run(ctx context.Context, st *AgentState, input string) ([]llm.Message, erro
 		// 2.5 执行工具、结果回喂历史，进入下一轮
 		executeTools(ctx, st, out.ToolCalls)
 	}
-	// ③ 兜底出口：模型陷入"永远要工具"的循环时止损
+	// ③ 兜底出口：补一条 UI-only 注释（模型不可见，前端/排查可见）
+	st.Messages = append(st.Messages, UINote("agent stopped: max steps (%d) exceeded", maxSteps))
+
 	return st.Messages, ErrMaxSteps
+}
+
+// buildView 执行两级管道：Transforms（裁剪投影）→ convertToLlm（过滤 Hidden）。
+// 输出是本次请求的临时视图；st.Messages 不被修改。
+func (st *AgentState) buildView(ctx context.Context) ([]llm.Message, error) {
+	msgs := st.Messages
+	for _, t := range st.Transforms {
+		var err error
+		if msgs, err = t(ctx, msgs); err != nil {
+			return nil, err
+		}
+	}
+	return convertToLlm(msgs), nil
 }
