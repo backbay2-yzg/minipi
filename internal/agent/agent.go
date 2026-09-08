@@ -28,8 +28,35 @@ type AgentState struct {
 	// nil/空 = 不裁剪，全量历史直发 —— 小对话的正确选择。
 	Transforms []TransformFunc
 
+	Bus *EventBus // ★ 事件总线；nil = 静默（既有测试零改动的前提）
+
 	Messages   []Message      // 对话历史（含中间的 tool 轮次）
 	TotalUsage llm.TokenUsage // 累计 token 消耗：循环顺带收集的遥测
+}
+
+// emit 是 Bus 的nil 安全包装：所有埋点统一走它，埋点处不再判空。
+func (st *AgentState) emit(ctx context.Context, ev Event) {
+	if st.Bus == nil {
+		return
+	}
+	st.Bus.Emit(ctx, ev)
+}
+
+// Run = 壳（生命周期事件）+ 核（循环）。
+// 壳保证 agent_start / agent_end 恰好各一次，错误路径也不漏发 agent_end
+// （订阅者靠它收尾 —— 终态事件丢失 = 订阅者 goroutine 泄漏）。
+func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
+	if st.Model == nil {
+		return st.Messages, errors.New("agent: nil model")
+	}
+	st.emit(ctx, Event{Kind: EventAgentStart})
+
+	var runErr error
+	defer func() { st.emit(ctx, Event{Kind: EventAgentEnd, Err: runErr}) }()
+
+	msgs, err := run(ctx, st, input)
+	runErr = err
+	return msgs, err
 }
 
 // Run 执行一轮完整交互：把用户输入加入历史，
@@ -40,11 +67,7 @@ type AgentState struct {
 //
 // ⚠️ 返回切片与 st.Messages 共享底层数组：调用方只读，切勿 append/修改。
 // （Day 6 引入 Session 持久化时会加显式快照）
-func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
-	if st.Model == nil {
-		return st.Messages, errors.New("agent: nil model")
-	}
-
+func run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 	maxSteps := st.MaxSteps
 	if maxSteps <= 0 {
 		maxSteps = DefaultMaxStep
@@ -57,6 +80,10 @@ func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 		specs = st.Tools.Specs()
 	}
 
+	// 流式能力探测：一次断言，整个循环生效。
+	// MockModel 等未实现 StreamingModel 的模型自动走 Complete 路径。
+	sm, canStream := st.Model.(llm.StreamingModel)
+
 	// ② 核心循环
 	for step := 0; step < maxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -64,18 +91,32 @@ func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 
 		}
 
+		st.emit(ctx, Event{Kind: EventTurnStart, Step: step})
+
 		// 2.1 ★ Day 4 核心：全量历史 → 两级管道 → 本次请求的视图
 		view, err := st.buildView(ctx)
 		if err != nil {
 			return st.Messages, fmt.Errorf("agent: step %d: build view: %w", step, err)
 		}
 
-		// 2.2 调模型：发送视图（不是 st.Messages 本体）
-		out, err := st.Model.Complete(ctx, llm.CompletionRequest{
+		req := llm.CompletionRequest{
 			Messages: view, // ★ 组装点：视图，非全量
 			System:   st.SystemPrompt,
 			Tools:    specs,
-		})
+		}
+
+		// 调模型：流式路径边到边发 message_update；两条路径最终都拿完整 Completion
+		st.emit(ctx, Event{Kind: EventMessageStart, Step: step})
+
+		var out *llm.Completion
+		if canStream {
+			out, err = sm.StreamComplete(ctx, req, func(delta string) {
+				st.emit(ctx, Event{Kind: EventMessageUpdate, Step: step, Delta: delta})
+			})
+		} else {
+			out, err = st.Model.Complete(ctx, req)
+		}
+
 		if err != nil {
 			return st.Messages, fmt.Errorf("agent: step %d: %w", step, err)
 		}
@@ -87,12 +128,17 @@ func Run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 		// 即使要走工具分支也先入历史——Provider 靠它和 toolResult 配对
 		st.Messages = append(st.Messages, AssistantMsg(out.Text, out.ToolCalls))
 
+		// ★ message_end 带完整文本：非流式 Provider 下订阅者靠它展示
+		st.emit(ctx, Event{Kind: EventMessageEnd, Step: step, Text: out.Text})
+
 		// 2.4 正常出口：模型没有请求工具 → 最终答案已产生
 		if len(out.ToolCalls) == 0 {
+			st.emit(ctx, Event{Kind: EventTurnEnd, Step: step})
 			return st.Messages, nil
 		}
 		// 2.5 执行工具、结果回喂历史，进入下一轮
-		executeTools(ctx, st, out.ToolCalls)
+		executeTools(ctx, st, out.ToolCalls, step)
+		st.emit(ctx, Event{Kind: EventTurnEnd, Step: step})
 	}
 	// ③ 兜底出口：补一条 UI-only 注释（模型不可见，前端/排查可见）
 	st.Messages = append(st.Messages, UINote("agent stopped: max steps (%d) exceeded", maxSteps))

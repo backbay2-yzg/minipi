@@ -18,14 +18,23 @@ import (
 //  2. 错误回喂：单个工具失败 ≠ 程序失败。错误文本作为 toolResult
 //     回喂，模型可自我纠正（换参数重试/换工具/放弃）——绝不中断循环
 //  3. 取消传播：gctx 随父 ctx 取消（用户 Ctrl+C → 进行中的工具 HTTP 调用中断）
-func executeTools(ctx context.Context, st *AgentState, calls []llm.ToolCall) {
+//
+// executeTools 并行执行一轮的全部工具调用，按调用顺序写回结果；
+// 每个调用发 tool_execution_start / tool_execution_end 事件。
+// 注意：并行时不同工具的事件**相对顺序不保证**（同一工具的 start→end 保证有序，
+// 因为它们在同一 goroutine 内顺序发出）；需要全局严格顺序的消费者应按 ToolCall.ID 归并。
+func executeTools(ctx context.Context, st *AgentState, calls []llm.ToolCall, step int) {
 	g, gctx := errgroup.WithContext(ctx)
 	results := make([]Message, len(calls))
 	for i, call := range calls {
 		// Go 1.22+ 循环变量每轮新建，此行可省；保留以示兼容老版本
 		i, call := i, call
 		g.Go(func() error {
-			results[i] = runOne(gctx, st.Tools, call)
+			st.emit(gctx, Event{Kind: EventToolExecStart, Step: step, ToolCall: &call})
+
+			res := runOne(gctx, st.Tools, call)
+			st.emit(gctx, Event{Kind: EventToolExecEnd, Step: step, ToolCall: &call, Result: res.Content})
+			results[i] = res
 			return nil // 永远返回 nil：失败是"给模型的信息"，不是批次失败
 		})
 	}

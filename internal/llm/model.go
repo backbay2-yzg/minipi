@@ -8,6 +8,16 @@ import (
 type Model interface {
 	Complete(ctx context.Context, req CompletionRequest) (*Completion, error)
 }
+
+// Sessioned 是可选能力：某些 Provider（如 OpenCode Go）要求按会话上报 ID，
+// 客户端"开新会话"（/new）时需要换一个新的会话 ID。
+// 与 StreamingModel 同款探测方式：
+//
+//	if s, ok := model.(llm.Sessioned); ok { s.NewSession() }
+type Sessioned interface {
+	NewSession() string // 返回新会话 ID
+}
+
 type Config struct {
 	Provider string // "openai" | "anthropic" | "opencode"
 	APIKey   string

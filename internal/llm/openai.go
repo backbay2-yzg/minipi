@@ -29,13 +29,32 @@ func NewOpenAI(apikey, baseURL, model string) *OpenAI {
 	}
 }
 
+// oaToolCall 增加 Index：流式 tool_calls 按 index 分片重组；非流式响应无此字段，零值无害。
 type oaToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"` // "function"
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"` // 注意：是 JSON 字符串，不是对象
-	} `json:"function"`
+	Index    int        `json:"index"`
+	ID       string     `json:"id"`
+	Type     string     `json:"type"` // "function"
+	Function oaFunction `json:"function"`
+}
+
+func toOAToolCalls(calls []ToolCall) []oaToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]oaToolCall, 0, len(calls))
+	for _, tc := range calls {
+		out = append(out, oaToolCall{
+			ID:       tc.ID,
+			Type:     "function",
+			Function: oaFunction{Name: tc.Name, Arguments: tc.Input},
+		})
+	}
+	return out
+}
+
+type oaFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type oaToolSpec struct {
@@ -55,12 +74,19 @@ type oaMessage struct {
 	ToolCalls  []oaToolCall `json:"tool_calls,omitempty"`   // assistant 发起调用时携带
 	ToolCallID string       `json:"tool_call_id,omitempty"` // role:"tool" 时回指调用
 }
+
+type oaStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
 type oaRequest struct {
-	Model       string      `json:"model"`
-	Messages    []oaMessage `json:"messages"`
-	Tools       []oaTool    `json:"tools,omitempty"`
-	MaxTokens   int         `json:"max_tokens,omitempty"`
-	Temperature *float32    `json:"temperature,omitempty"`
+	Model         string           `json:"model"`
+	Messages      []oaMessage      `json:"messages"`
+	Tools         []oaTool         `json:"tools,omitempty"`
+	MaxTokens     int              `json:"max_tokens,omitempty"`
+	Temperature   *float32         `json:"temperature,omitempty"`
+	Stream        bool             `json:"stream,omitempty"`         // ★ 仅流式置 true
+	StreamOptions *oaStreamOptions `json:"stream_options,omitempty"` // ★ 仅流式置
 }
 
 type oaResponse struct {

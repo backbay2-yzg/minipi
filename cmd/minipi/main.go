@@ -42,7 +42,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-
+	bus := agent.NewEventBus(128)
 	st := &agent.AgentState{
 		Model:        m,
 		SystemPrompt: "You are a helpful assistant. Answer concisely.",
@@ -52,9 +52,36 @@ func main() {
 		),
 		// ★ Day 4：滑动窗口。教学期建议先设 2，肉眼观察裁剪生效后再调大
 		Transforms: []agent.TransformFunc{agent.PruneByTurns(2)},
+		Bus:        bus, // ★ Day 5：接上总线
 	}
 
-	fmt.Printf("mini-pi day2 | provider=%s model=%s\n", provider, model)
+	// 订阅者：独立 goroutine 持续消费（Emit 阻塞投递的纪律要求）。
+	// streamed 标记让订阅者对 Provider 无感：
+	//   流式（OpenAI）→ 打 delta；非流式→ 打 message_end 的完整文本
+	ch, cancel := bus.Subscribe()
+	defer cancel()
+	streamed := false
+
+	go func() {
+		for ev := range ch {
+			switch ev.Kind {
+			case agent.EventMessageUpdate:
+				streamed = true
+				fmt.Print(ev.Delta)
+			case agent.EventMessageEnd:
+				if streamed {
+					fmt.Println()
+				} else {
+					fmt.Println(ev.Text)
+				}
+				streamed = false
+			case agent.EventToolExecEnd:
+				fmt.Printf("  [tool %s] %s\n", ev.ToolCall.Name, ev.Result)
+			}
+		}
+	}()
+
+	fmt.Printf("mini-pi day5 | provider=%s model=%s\n", provider, model)
 	fmt.Println("输入消息回车发送；/new 清空会话；/quit 退出")
 
 	sc := bufio.NewScanner(os.Stdin)
@@ -72,6 +99,10 @@ func main() {
 		case line == "/new":
 			st.Messages = nil
 			st.TotalUsage = llm.TokenUsage{}
+			// 同步换一个 Provider 会话 ID（OpenCode Go 靠它做路由与缓存优化）
+			if s, ok := m.(llm.Sessioned); ok {
+				s.NewSession()
+			}
 			fmt.Println("(session cleared)")
 			continue
 		case line == "/history":
@@ -92,18 +123,24 @@ func main() {
 			st.Messages = st.Messages[:turnStart]
 			continue
 		}
-
-		// 正常出口的最后一条消息必是 assistant
-		fmt.Println(msgs[len(msgs)-1].Content)
-
-		for _, m := range msgs[turnStart:] {
-			if m.Role == llm.RoleToolResult {
-				fmt.Printf("  [tool %s] %s\n", m.ToolCallID, m.Content)
-			}
-		}
+		// ★ 注意：助手回答不再从返回值打印 —— 它由订阅者经事件输出
+		//（流式打 delta / 非流式打 message_end 文本），避免双份。
 		fmt.Printf("  [usage] turn in=%d | total in=%d out=%d\n",
 			st.TotalUsage.InputTokens-inBefore,
 			st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
+		_ = msgs // 保留返回值供未来逻辑用（持久化等）
+
+		//// 正常出口的最后一条消息必是 assistant
+		//fmt.Println(msgs[len(msgs)-1].Content)
+		//
+		//for _, m := range msgs[turnStart:] {
+		//	if m.Role == llm.RoleToolResult {
+		//		fmt.Printf("  [tool %s] %s\n", m.ToolCallID, m.Content)
+		//	}
+		//}
+		//fmt.Printf("  [usage] turn in=%d | total in=%d out=%d\n",
+		//	st.TotalUsage.InputTokens-inBefore,
+		//	st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
 	}
 }
 

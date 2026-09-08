@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -274,5 +275,72 @@ func TestAnthropicToolRoundTrip(t *testing.T) {
 	}
 	if out.StopReason != StopReasonToolUse {
 		t.Errorf("stop = %s", out.StopReason)
+	}
+}
+
+// 场景：SSE 流式 —— 文本分片回调 + tool_calls 跨片按 index 重组 + 尾部 usage
+func TestOpenAIStreamComplete(t *testing.T) {
+	var gotBody oaRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		lines := []string{
+			`data: {"choices":[{"delta":{"content":"Hel"}}]}`, "",
+			`data: {"choices":[{"delta":{"content":"lo"}}]}`, "",
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","type":"function",` +
+				`"function":{"name":"calc","arguments":"{\"a\":1"}}]}}]}`, "", // 首片：id+name+参数前半
+			`data: {"choices":[{"delta":{"tool_calls":[{"index":0,` +
+				`"function":{"arguments":",\"b\":2}"}}]}}]}`, "", // 次片：参数后半
+			`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`, "",
+			`data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}`, "",
+			`data: [DONE]`, "",
+		}
+		for _, l := range lines {
+			w.Write([]byte(l + "\n"))
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	m := NewOpenAI("k", srv.URL, "gpt-4o-mini")
+	var deltas []string
+	out, err := m.StreamComplete(context.Background(), CompletionRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	}, func(d string) { deltas = append(deltas, d) })
+	if err != nil {
+		t.Fatalf("StreamComplete: %v", err)
+	}
+
+	// 请求侧 ★：流式三件套必须发出
+	if !gotBody.Stream {
+		t.Error("request stream = false, want true")
+	}
+	if gotBody.StreamOptions == nil || !gotBody.StreamOptions.IncludeUsage {
+		t.Error("request stream_options.include_usage not set")
+	}
+
+	// delta 回调：顺序与拼接
+	if strings.Join(deltas, "") != "Hello" {
+		t.Errorf("deltas = %q", deltas)
+	}
+	// tool_calls 重组：跨片 arguments 拼接成功
+	if len(out.ToolCalls) != 1 || out.ToolCalls[0].ID != "c9" ||
+		out.ToolCalls[0].Name != "calc" {
+		t.Fatalf("toolCalls = %+v", out.ToolCalls)
+	}
+	var args struct {
+		A, B int
+	}
+	if err := json.Unmarshal([]byte(out.ToolCalls[0].Input), &args); err != nil {
+		t.Fatalf("assembled args = %q: %v", out.ToolCalls[0].Input, err)
+	}
+	if args.A != 1 || args.B != 2 {
+		t.Errorf("args = %+v", args)
+	}
+	if out.StopReason != StopReasonToolUse || out.Usage.OutputTokens != 3 {
+		t.Errorf("stop=%s usage=%+v", out.StopReason, out.Usage)
 	}
 }
