@@ -12,9 +12,9 @@ const (
 
 // ToolCall 是 assistant 发起的工具调用
 type ToolCall struct {
-	ID    string // Provider 生成的调用 ID，toolResult 需回指它
-	Name  string
-	Input string // JSON 字符串
+	ID    string `json:"id"` // Provider 生成的调用 ID，toolResult 需回指它
+	Name  string `json:"name"`
+	Input string `json:"input"` // JSON 字符串
 }
 
 // ToolSpec 是暴露给模型的工具描述
@@ -40,16 +40,16 @@ const (
 )
 
 type TokenUsage struct {
-	InputTokens  int
-	OutputTokens int
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 // Message 是 mini-pi 的统一消息。
 type Message struct {
-	Role       Role
-	Content    string
-	ToolCalls  []ToolCall // assistant 专属
-	ToolCallID string     // toolResult 专属
+	Role       Role       `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 专属
+	ToolCallID string     `json:"tool_call_id,omitempty"` // toolResult 专属
 }
 
 type CompletionRequest struct {

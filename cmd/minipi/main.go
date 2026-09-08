@@ -4,13 +4,40 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"minipi/internal/session"
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"minipi/internal/agent"
 	"minipi/internal/llm"
 )
+
+const (
+	systemPrompt       = "You are a helpful assistant. Answer concisely."
+	compactThresholdTx = 8 // 轮数超过此值触发压缩
+	compactKeepTx      = 4 // 压缩后保留最近轮数
+)
+
+// toolFactories 组合根的工具目录：持久化只存名字，恢复经此重建行为。
+func toolFactories() map[string]func() agent.Tool {
+	return map[string]func() agent.Tool{
+		"get_time": func() agent.Tool { return agent.NewTimeTool() },
+		"calc":     func() agent.Tool { return agent.NewCalcTool() },
+	}
+}
+
+func newSession(provider, model, baseURL, sysPrompt string, reg *agent.Registry) *session.Session {
+	return &session.Session{
+		ID:        session.NewID(),
+		CreatedAt: time.Now(),
+		Config: session.Config{
+			Provider: provider, ModelName: model, BaseURL: baseURL,
+			SystemPrompt: sysPrompt, ToolNames: reg.Names(),
+		},
+	}
+}
 
 func main() {
 	provider := envOr("MINIPI_PROVIDER", "opencode")
@@ -29,6 +56,9 @@ func main() {
 	}
 	model := envOr("MINIPI_MODEL", defaultModel)
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
 	m, err := llm.New(llm.Config{
 		Provider: provider,
 		APIKey:   apiKey,
@@ -40,24 +70,56 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	store, err := session.NewSQLiteStore(envOr("MINIPI_SESSION_DB", "minipi_sessions.db"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	bus := agent.NewEventBus(128)
-	st := &agent.AgentState{
-		Model:        m,
-		SystemPrompt: "You are a helpful assistant. Answer concisely.",
-		Tools: agent.NewRegistry( // ★ 真实工具上线
-			agent.NewTimeTool(),
-			agent.NewCalcTool(),
-		),
-		// ★ Day 4：滑动窗口。教学期建议先设 2，肉眼观察裁剪生效后再调大
-		Transforms: []agent.TransformFunc{agent.PruneByTurns(2)},
-		Bus:        bus, // ★ Day 5：接上总线
+
+	os.Setenv("MINIPI_SESSION_ID", "20260908-215058-6ceea8f4")
+	// ---- 会话：恢复或新建 ----
+	// ★ 组装点：恢复路径 = 数据从磁盘来（sess.State）+ 行为从代码来（runtime）
+	var st *agent.AgentState
+	var sess *session.Session
+	if id := os.Getenv("MINIPI_SESSION_ID"); id != "" {
+		sess, err = store.Load(ctx, id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resume:", err)
+			os.Exit(1)
+		}
+		reg, rerr := agent.BuildRegistry(sess.Config.ToolNames, toolFactories())
+		if rerr != nil {
+			fmt.Fprintln(os.Stderr, rerr)
+			os.Exit(1)
+		}
+		st = &agent.AgentState{
+			Model:        m, // 当前环境的模型（设计决策：模型升级无缝）
+			SystemPrompt: sess.Config.SystemPrompt,
+			Tools:        reg,
+			Transforms:   []agent.TransformFunc{agent.PruneByTurns(2)}, // 策略，不持久化
+			Messages:     sess.State.Messages,
+			TotalUsage:   sess.State.TotalUsage,
+			Bus:          bus,
+		}
+		fmt.Printf("resumed %s (%d messages)\n", sess.ID, len(st.Messages))
+	} else {
+		reg := agent.NewRegistry(agent.NewTimeTool(), agent.NewCalcTool())
+		st = &agent.AgentState{
+			Model:        m,
+			SystemPrompt: systemPrompt,
+			Tools:        reg,
+			Transforms:   []agent.TransformFunc{agent.PruneByTurns(2)},
+			Bus:          bus,
+		}
+		sess = newSession(provider, model, os.Getenv("MINIPI_BASE_URL"), systemPrompt, reg)
 	}
 
 	// 订阅者：独立 goroutine 持续消费（Emit 阻塞投递的纪律要求）。
 	// streamed 标记让订阅者对 Provider 无感：
 	//   流式（OpenAI）→ 打 delta；非流式→ 打 message_end 的完整文本
+	// ---- 订阅者：Day 5 语义 + Day 6 压缩事件 ----
 	ch, cancel := bus.Subscribe()
 	defer cancel()
 	streamed := false
@@ -77,12 +139,15 @@ func main() {
 				streamed = false
 			case agent.EventToolExecEnd:
 				fmt.Printf("  [tool %s] %s\n", ev.ToolCall.Name, ev.Result)
+			case agent.EventCompactionEnd:
+				fmt.Printf("  [compaction] old turns summarized: %s\n", firstRunes(ev.Text, 40))
+
 			}
 		}
 	}()
 
-	fmt.Printf("mini-pi day5 | provider=%s model=%s\n", provider, model)
-	fmt.Println("输入消息回车发送；/new 清空会话；/quit 退出")
+	fmt.Printf("mini-pi day6 | provider=%s model=%s | session=%s\n", provider, model, sess.ID)
+	fmt.Println("输入消息回车发送；/info 会话信息；/list 历史会话；/new 新会话；/quit 退出")
 
 	sc := bufio.NewScanner(os.Stdin)
 	for {
@@ -103,7 +168,25 @@ func main() {
 			if s, ok := m.(llm.Sessioned); ok {
 				s.NewSession()
 			}
-			fmt.Println("(session cleared)")
+			fmt.Println("(new session:", sess.ID+")")
+			continue
+		case line == "/info":
+			fmt.Printf("  session  %s\n", sess.ID)
+			fmt.Printf("  messages %d (%d turns)\n", len(st.Messages), agent.CountTransactions(st.Messages))
+			fmt.Printf("  model    %s/%s\n", sess.Config.Provider, sess.Config.ModelName)
+			fmt.Printf("  tools    %v\n", sess.Config.ToolNames)
+			fmt.Printf("  usage    in=%d out=%d\n", st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
+			continue
+		case line == "/list":
+			metas, lerr := store.List(ctx)
+			if lerr != nil {
+				fmt.Println("list error:", lerr)
+				continue
+			}
+			for _, mt := range metas {
+				fmt.Printf("  %s  msgs=%-3d  %s\n", mt.ID, mt.Messages, mt.Title)
+			}
+			fmt.Println("  (resume: MINIPI_SESSION_ID=<id> go run ./cmd/minipi)")
 			continue
 		case line == "/history":
 			for i, m := range st.Messages {
@@ -123,6 +206,22 @@ func main() {
 			st.Messages = st.Messages[:turnStart]
 			continue
 		}
+
+		// 压缩检查：轮数超阈值 → 压缩（显式、独立于 Run；失败非致命）
+		if n := agent.CountTransactions(st.Messages); n > compactThresholdTx {
+			if _, cerr := agent.Compact(ctx, st, compactKeepTx); cerr != nil {
+				fmt.Println("compaction error:", cerr)
+			}
+		}
+
+		// 事务点：Run 成功（可能已压缩）→ 状态一致 → 落盘
+		// json.Marshal 是快照语义：此刻序列化，之后的 append 不影响文件内容
+		sess.State = session.State{Messages: st.Messages, TotalUsage: st.TotalUsage}
+		sess.UpdatedAt = time.Now()
+		if serr := store.Save(ctx, sess); serr != nil {
+			fmt.Println("save error:", serr)
+		}
+
 		// ★ 注意：助手回答不再从返回值打印 —— 它由订阅者经事件输出
 		//（流式打 delta / 非流式打 message_end 文本），避免双份。
 		fmt.Printf("  [usage] turn in=%d | total in=%d out=%d\n",
@@ -142,6 +241,14 @@ func main() {
 		//	st.TotalUsage.InputTokens-inBefore,
 		//	st.TotalUsage.InputTokens, st.TotalUsage.OutputTokens)
 	}
+}
+
+func firstRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		r = r[:n]
+	}
+	return string(r)
 }
 
 func envOr(key, def string) string {

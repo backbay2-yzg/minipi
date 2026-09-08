@@ -23,6 +23,9 @@ const (
 	EventToolExecEnd   EventKind = "tool_execution_end"
 	EventTurnEnd       EventKind = "turn_end"
 	EventAgentEnd      EventKind = "agent_end" // 终态事件：订阅者据此收尾
+
+	EventCompactionStart EventKind = "compaction_start"
+	EventCompactionEnd   EventKind = "compaction_end"
 )
 
 // Event 是总线上的一次投递。字段按 Kind 取用：

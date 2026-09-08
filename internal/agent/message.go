@@ -19,8 +19,8 @@ import (
 // toolCall/toolResult 配对 —— 管道两级的结构安全都以"协议消息不藏"为前提。
 type Message struct {
 	llm.Message
-	CreatedAt time.Time
-	Hidden    bool
+	CreatedAt time.Time `json:"created_at"`
+	Hidden    bool      `json:"hidden,omitempty"`
 }
 
 // ---- 构造函数：统一设置 CreatedAt，协议消息 Hidden 恒为 false ----

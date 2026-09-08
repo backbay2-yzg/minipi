@@ -165,3 +165,8 @@ func TruncateToolResults(maxChars int) TransformFunc {
 		return out, nil
 	}
 }
+
+// CountTransactions 返回历史中的轮数（压缩触发判断等场景用）
+func CountTransactions(msgs []Message) int {
+	return len(splitTransactions(msgs))
+}

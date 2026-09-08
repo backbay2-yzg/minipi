@@ -66,6 +66,29 @@ func (r *Registry) Specs() []llm.ToolSpec {
 	return out
 }
 
+// Names 按注册顺序返回工具名（持久化用；返回拷贝，防外部改乱 order）
+func (r *Registry) Names() []string {
+	out := make([]string, len(r.order))
+	copy(out, r.order)
+	return out
+}
+
+// BuildRegistry 从名字列表重建 Registry（会话恢复路径）。
+// factories 是"名字 → 构造函数"映射，由组合根（main）提供——
+// agent 包依旧不认识任何具体工具，依赖方向保持干净。
+// 未知名字 = 配置漂移（会话由不同版本代码创建）→ 显式报错，不静默跳过。
+func BuildRegistry(names []string, factories map[string]func() Tool) (*Registry, error) {
+	reg := NewRegistry()
+	for _, n := range names {
+		f, ok := factories[n]
+		if !ok {
+			return nil, fmt.Errorf("agent: unknown tool %q (session created by a different version?)", n)
+		}
+		reg.Register(f())
+	}
+	return reg, nil
+}
+
 type TimeTool struct{}
 
 func NewTimeTool() *TimeTool {
