@@ -344,3 +344,25 @@ func TestOpenAIStreamComplete(t *testing.T) {
 		t.Errorf("stop=%s usage=%+v", out.StopReason, out.Usage)
 	}
 }
+
+// OpenCode 的 fork 共享并发安全的 HTTP 客户端，但必须拥有独立会话 ID。
+func TestOpenCodeForkUsesIndependentSession(t *testing.T) {
+	root := NewOpenCode("test-key", "http://example.invalid", "test-model")
+	first, ok := root.Fork().(*OpenCode)
+	if !ok {
+		t.Fatal("OpenCode.Fork returned a different model type")
+	}
+	second, ok := root.Fork().(*OpenCode)
+	if !ok {
+		t.Fatal("OpenCode.Fork returned a different model type")
+	}
+
+	if first.SessionID() == root.SessionID() || second.SessionID() == root.SessionID() ||
+		first.SessionID() == second.SessionID() {
+		t.Fatalf("forked session IDs are not unique: root=%q first=%q second=%q",
+			root.SessionID(), first.SessionID(), second.SessionID())
+	}
+	if first.HTTP != root.HTTP || second.HTTP != root.HTTP {
+		t.Fatal("fork should reuse the root HTTP client and connection pool")
+	}
+}

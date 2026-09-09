@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ocChunk 是 SSE 里单个事件的形状：choices[].delta（不是 message）、
@@ -59,11 +60,25 @@ func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 		return nil, fmt.Errorf("opencode: marshal: %w", err)
 	}
 
-	resp, err := o.do(ctx, body)
+	// 流式请求不能使用 http.Client 的总超时。单独派生一个可取消 context，
+	// 后面的空闲看门狗触发时可直接关闭响应体，解除 Scanner 的阻塞读取。
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	resp, err := o.do(streamCtx, body)
 	if err != nil {
 		return nil, fmt.Errorf("opencode: do: %w", err)
 	}
 	defer resp.Body.Close()
+
+	idleTimeout := o.sseIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultOpenCodeSSEIdleTimeout
+	}
+	// 建连、TLS 和响应头分别由 Transport 限时；收到响应头以后，只有连续
+	// idleTimeout 没有任何 SSE 行才取消。reasoning_content 和注释心跳虽然
+	// 不展示给用户，也都会在 Scanner 层重置此计时器。
+	watchdog := time.AfterFunc(idleTimeout, cancel)
+	defer watchdog.Stop()
 
 	if resp.StatusCode != http.StatusOK {
 		var buf bytes.Buffer
@@ -85,6 +100,7 @@ func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 单行上限 1MB
 	for scanner.Scan() {
+		watchdog.Reset(idleTimeout)
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") { // 空行 / 注释心跳
 			continue
@@ -135,6 +151,11 @@ func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		// 外层 ctx 未取消、只有 streamCtx 被取消，说明是空闲看门狗触发。
+		// 单独标记便于区分用户取消、网络错误和真正的无数据超时。
+		if ctx.Err() == nil && streamCtx.Err() != nil {
+			return nil, fmt.Errorf("opencode: sse idle > %v: %w", idleTimeout, streamCtx.Err())
+		}
 		return nil, fmt.Errorf("opencode: sse read: %w", err)
 	}
 	if finish == "" {

@@ -24,11 +24,21 @@ import (
 // 不能发通用 HTTP 库名（Go 默认的 "Go-http-client/1.1" 会被当成 SDK/库流量）。
 const openCodeUserAgent = "minipi/0.1"
 
+const (
+	// 非流式响应必须完整读完，保留总时长上限，避免普通请求永久挂起。
+	openCodeCompleteTimeout = 120 * time.Second
+	// 流式响应不限制总生成时长；只有连续一段时间没有收到任何 SSE 数据
+	// 才认为连接已经僵死。该值放在实例中，方便测试使用更短的时间。
+	defaultOpenCodeSSEIdleTimeout = 90 * time.Second
+)
+
 type OpenCode struct {
 	apiKey  string
 	model   string
 	baseURL string
 	HTTP    *http.Client
+	// sseIdleTimeout 只约束两段 SSE 数据之间的空闲时间，不约束整次生成时长。
+	sseIdleTimeout time.Duration
 	// sessionID 在一次会话内保持稳定，随请求放进 x-opencode-session 头。
 	// 缺失该头 → 400 {"type":"MissingSessionID"}。
 	sessionID string
@@ -39,11 +49,15 @@ func NewOpenCode(apiKey, baseURL, model string) *OpenCode {
 		baseURL = "https://opencode.ai/zen/go/v1"
 	}
 	return &OpenCode{
-		apiKey:    apiKey,
-		model:     model,
-		baseURL:   baseURL,
-		HTTP:      &http.Client{Timeout: 120 * time.Second, Transport: newOpenCodeTransport()},
-		sessionID: newOpenCodeSessionID(),
+		apiKey:  apiKey,
+		model:   model,
+		baseURL: baseURL,
+		// Client.Timeout 会覆盖“建连直到响应体读完”的全过程，不适合 SSE：
+		// 即使模型持续输出，长生成也会在固定时刻被强制截断。分阶段超时见
+		// Transport、Complete 和 StreamComplete。
+		HTTP:           &http.Client{Transport: newOpenCodeTransport()},
+		sseIdleTimeout: defaultOpenCodeSSEIdleTimeout,
+		sessionID:      newOpenCodeSessionID(),
 	}
 }
 
@@ -84,6 +98,15 @@ func newOpenCodeSessionID() string {
 func (o *OpenCode) NewSession() string {
 	o.sessionID = newOpenCodeSessionID()
 	return o.sessionID
+}
+
+// Fork 为一段独立的子代理对话创建新的 OpenCode 会话。
+// 配置和 http.Client 只读且支持并发使用，所以可以安全共享连接池；只有
+// sessionID 必须独立，避免多个并发子代理使用同一个 x-opencode-session。
+func (o *OpenCode) Fork() Model {
+	clone := *o
+	clone.sessionID = newOpenCodeSessionID()
+	return &clone
 }
 
 func (o *OpenCode) SessionID() string { return o.sessionID }
@@ -201,6 +224,10 @@ type ocResponse struct {
 }
 
 func (o *OpenCode) Complete(ctx context.Context, req CompletionRequest) (*Completion, error) {
+	// 非流式调用没有可用于判断活性的中间数据，因此使用总时长上限。
+	ctx, cancel := context.WithTimeout(ctx, openCodeCompleteTimeout)
+	defer cancel()
+
 	body, err := json.Marshal(o.buildRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("opencode: marshal: %w", err)

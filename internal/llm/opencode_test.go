@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 手法沿用 TestOpenAIComplete：httptest 起一个假 OpenCode Zen，
@@ -243,6 +245,67 @@ func TestOpenCodeEmptyChoices(t *testing.T) {
 		Messages: []Message{{Role: RoleUser, Content: "hi"}},
 	}); err == nil {
 		t.Fatal("expected error for empty choices")
+	}
+}
+
+// 活跃的 SSE 即使总时长超过空闲阈值也应完成。GLM 的 reasoning_content
+// 当前不会展示，但它仍是有效流量，必须为连接续期。
+func TestOpenCodeStreamAllowsLongActiveResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < 7; i++ {
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}`)
+			fmt.Fprintln(w)
+			flusher.Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, `data: [DONE]`)
+		fmt.Fprintln(w)
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	m := NewOpenCode("k", srv.URL, "m")
+	m.sseIdleTimeout = 150 * time.Millisecond
+	if m.HTTP.Timeout != 0 {
+		t.Fatalf("streaming client has whole-request timeout %v, want 0", m.HTTP.Timeout)
+	}
+	started := time.Now()
+	out, err := m.StreamComplete(context.Background(), CompletionRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("StreamComplete: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed <= m.sseIdleTimeout {
+		t.Fatalf("test stream lasted %v, want longer than idle timeout %v", elapsed, m.sseIdleTimeout)
+	}
+	if out.Text != "done" || out.StopReason != StopReasonEndTurn {
+		t.Fatalf("completion = %+v", out)
+	}
+}
+
+// 响应头已经到达但响应体不再产生任何数据时，看门狗应主动解除读取阻塞。
+func TestOpenCodeStreamIdleTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	m := NewOpenCode("k", srv.URL, "m")
+	m.sseIdleTimeout = 40 * time.Millisecond
+	_, err := m.StreamComplete(context.Background(), CompletionRequest{
+		Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "sse idle") {
+		t.Fatalf("err = %v, want SSE idle timeout", err)
 	}
 }
 

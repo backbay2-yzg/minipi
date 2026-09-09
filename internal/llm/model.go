@@ -18,6 +18,16 @@ type Sessioned interface {
 	NewSession() string // 返回新会话 ID
 }
 
+// SessionForker 是带 Provider 会话状态的 Model 可选实现的能力。
+//
+// 一个 SubAgentTool 实例可能在同一轮被并发调用多次。每个子代理都是一段
+// 独立对话，因此不能复用父代理或其他子代理的 Provider 会话 ID；否则上游
+// 可能把并发请求当成同一段对话进行排队。Fork 应保留只读配置，并为返回的
+// Model 创建独立会话。没有会话状态的 Model 无需实现此接口。
+type SessionForker interface {
+	Fork() Model
+}
+
 type Config struct {
 	Provider string // "openai" | "anthropic" | "opencode"
 	APIKey   string
