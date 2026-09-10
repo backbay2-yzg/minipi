@@ -14,3 +14,11 @@ type StreamingModel interface {
 	StreamComplete(ctx context.Context, req CompletionRequest,
 		onDelta func(text string)) (*Completion, error)
 }
+
+// ReasoningStreamingModel adds a separate display-only stream for provider
+// reasoning. Reasoning is not part of onDelta or Completion.Text.
+type ReasoningStreamingModel interface {
+	StreamingModel
+	StreamCompleteWithReasoning(ctx context.Context, req CompletionRequest,
+		onDelta func(string), onReasoning func(string)) (*Completion, error)
+}

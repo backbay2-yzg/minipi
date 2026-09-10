@@ -132,35 +132,10 @@ func main() {
 		sess = newSession(provider, model, os.Getenv("MINIPI_BASE_URL"), systemPrompt, baseTools)
 	}
 
-	// 订阅者：独立 goroutine 持续消费（Emit 阻塞投递的纪律要求）。
-	// streamed 标记让订阅者对 Provider 无感：
-	//   流式（OpenAI）→ 打 delta；非流式→ 打 message_end 的完整文本
-	// ---- 订阅者：Day 5 语义 + Day 6 压缩事件 ----
+	// 单一订阅者按来源显示正文和思考，防止并发流无法辨认。
 	ch, cancel := bus.Subscribe()
 	defer cancel()
-	streamed := false
-
-	go func() {
-		for ev := range ch {
-			switch ev.Kind {
-			case agent.EventMessageUpdate:
-				streamed = true
-				fmt.Print(ev.Delta)
-			case agent.EventMessageEnd:
-				if streamed {
-					fmt.Println()
-				} else {
-					fmt.Println(ev.Text)
-				}
-				streamed = false
-			case agent.EventToolExecEnd:
-				fmt.Printf("  [tool %s] %s\n", ev.ToolCall.Name, ev.Result)
-			case agent.EventCompactionEnd:
-				fmt.Printf("  [compaction] old turns summarized: %s\n", firstRunes(ev.Text, 40))
-
-			}
-		}
-	}()
+	go printEvents(os.Stdout, ch)
 
 	fmt.Printf("mini-pi day6 | provider=%s model=%s | session=%s\n", provider, model, sess.ID)
 	fmt.Println("输入消息回车发送，运行中可直接输入插话(steer)；/info 会话信息；/list 历史会话；/new 新会话；/quit 退出")

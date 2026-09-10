@@ -23,6 +23,7 @@ const SteerQueueCap = 16
 // 由 Run 独占读写 —— 单 goroutine 使用无需加锁。
 // （将来多 Agent 并发时，每个 Agent 各持一份 state）
 type AgentState struct {
+	AgentID      string // 日志来源；空值表示主 Agent。
 	SystemPrompt string
 	Model        llm.Model
 	//ToolSpecs    []llm.ToolSpec // 声明给模型的工具描述（Day 3 引入执行绑定）
@@ -88,6 +89,10 @@ func (st *AgentState) emit(ctx context.Context, ev Event) {
 	if st.Bus == nil {
 		return
 	}
+	ev.AgentID = st.AgentID
+	if ev.AgentID == "" {
+		ev.AgentID = "main"
+	}
 	st.Bus.Emit(ctx, ev)
 }
 
@@ -134,6 +139,7 @@ func run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 	// 流式能力探测：一次断言，整个循环生效。
 	// MockModel 等未实现 StreamingModel 的模型自动走 Complete 路径。
 	sm, canStream := st.Model.(llm.StreamingModel)
+	rm, canReason := st.Model.(llm.ReasoningStreamingModel)
 
 	// ② 核心循环
 	for step := 0; step < maxSteps; step++ {
@@ -163,10 +169,15 @@ func run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 		st.emit(ctx, Event{Kind: EventMessageStart, Step: step})
 
 		var out *llm.Completion
-		if canStream {
-			out, err = sm.StreamComplete(ctx, req, func(delta string) {
-				st.emit(ctx, Event{Kind: EventMessageUpdate, Step: step, Delta: delta})
+		onDelta := func(delta string) {
+			st.emit(ctx, Event{Kind: EventMessageUpdate, Step: step, Delta: delta})
+		}
+		if canReason {
+			out, err = rm.StreamCompleteWithReasoning(ctx, req, onDelta, func(delta string) {
+				st.emit(ctx, Event{Kind: EventReasoningUpdate, Step: step, Delta: delta})
 			})
+		} else if canStream {
+			out, err = sm.StreamComplete(ctx, req, onDelta)
 		} else {
 			out, err = st.Model.Complete(ctx, req)
 		}
@@ -191,7 +202,6 @@ func run(ctx context.Context, st *AgentState, input string) ([]Message, error) {
 			return st.Messages, nil
 		}
 		// 2.5 执行工具、结果回喂历史，进入下一轮
-		fmt.Println("out.ToolCalls:", out.ToolCalls)
 		executeTools(ctx, st, out.ToolCalls, step)
 
 		// ★ 注入点 2：工具阶段结束后、下一轮 Complete 前——

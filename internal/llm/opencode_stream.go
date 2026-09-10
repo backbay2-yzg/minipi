@@ -18,8 +18,9 @@ import (
 type ocChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string       `json:"content"`
-			ToolCalls []ocToolCall `json:"tool_calls,omitempty"`
+			ReasoningContent string       `json:"reasoning_content"`
+			Content          string       `json:"content"`
+			ToolCalls        []ocToolCall `json:"tool_calls,omitempty"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -49,6 +50,13 @@ type ocCallAcc struct {
 // 不重复那 20 行翻译逻辑（OpenCode 版本一开始就抽好了这个函数）。
 func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 	onDelta func(string)) (*Completion, error) {
+	return o.StreamCompleteWithReasoning(ctx, req, onDelta, nil)
+}
+
+// StreamCompleteWithReasoning forwards reasoning deltas as they arrive without
+// adding them to the answer or retaining the full reasoning in memory.
+func (o *OpenCode) StreamCompleteWithReasoning(ctx context.Context, req CompletionRequest,
+	onDelta func(string), onReasoning func(string)) (*Completion, error) {
 
 	// 1. 复用非流式的翻译，再叠加 ★ 流式三件套
 	r := o.buildRequest(req)
@@ -75,8 +83,7 @@ func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 		idleTimeout = defaultOpenCodeSSEIdleTimeout
 	}
 	// 建连、TLS 和响应头分别由 Transport 限时；收到响应头以后，只有连续
-	// idleTimeout 没有任何 SSE 行才取消。reasoning_content 和注释心跳虽然
-	// 不展示给用户，也都会在 Scanner 层重置此计时器。
+	// idleTimeout 没有任何 SSE 行才取消。推理片段和注释心跳也会重置计时器。
 	watchdog := time.AfterFunc(idleTimeout, cancel)
 	defer watchdog.Stop()
 
@@ -125,6 +132,9 @@ func (o *OpenCode) StreamComplete(ctx context.Context, req CompletionRequest,
 		}
 
 		for _, c := range chunk.Choices {
+			if c.Delta.ReasoningContent != "" && onReasoning != nil {
+				onReasoning(c.Delta.ReasoningContent)
+			}
 			if c.FinishReason != nil {
 				finish = *c.FinishReason
 			}

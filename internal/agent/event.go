@@ -14,15 +14,16 @@ import (
 type EventKind string
 
 const (
-	EventAgentStart    EventKind = "agent_start"
-	EventTurnStart     EventKind = "turn_start"
-	EventMessageStart  EventKind = "message_start"
-	EventMessageUpdate EventKind = "message_update" // 流式增量
-	EventMessageEnd    EventKind = "message_end"
-	EventToolExecStart EventKind = "tool_execution_start"
-	EventToolExecEnd   EventKind = "tool_execution_end"
-	EventTurnEnd       EventKind = "turn_end"
-	EventAgentEnd      EventKind = "agent_end" // 终态事件：订阅者据此收尾
+	EventAgentStart      EventKind = "agent_start"
+	EventTurnStart       EventKind = "turn_start"
+	EventMessageStart    EventKind = "message_start"
+	EventMessageUpdate   EventKind = "message_update"   // 流式增量
+	EventReasoningUpdate EventKind = "reasoning_update" // 展示用思考增量，不写入历史
+	EventMessageEnd      EventKind = "message_end"
+	EventToolExecStart   EventKind = "tool_execution_start"
+	EventToolExecEnd     EventKind = "tool_execution_end"
+	EventTurnEnd         EventKind = "turn_end"
+	EventAgentEnd        EventKind = "agent_end" // 终态事件：订阅者据此收尾
 
 	EventCompactionStart EventKind = "compaction_start"
 	EventCompactionEnd   EventKind = "compaction_end"
@@ -35,6 +36,7 @@ const (
 //	tool_execution_*     → ToolCall；tool_execution_end 另带 Result
 //	agent_end            → Err（nil 表示正常结束）
 type Event struct {
+	AgentID  string
 	Kind     EventKind
 	Step     int
 	Delta    string

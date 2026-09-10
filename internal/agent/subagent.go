@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"minipi/internal/llm"
 )
@@ -56,8 +57,9 @@ type subAgentArgs struct {
 	Task string `json:"task"`
 }
 
+var subAgentSequence atomic.Uint64
+
 func (t *SubAgentTool) Run(ctx context.Context, args json.RawMessage) (string, error) {
-	fmt.Println("SubAgentTool Run")
 	var p subAgentArgs
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("delegate_task: bad args: %w", err)
@@ -67,8 +69,7 @@ func (t *SubAgentTool) Run(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	// 子 Agent：全新状态 + 继承 ctx + 继承事件总线。
-	// 已知代价：子事件与父事件在总线交错，订阅者靠 ToolCall/Step 无法区分
-	// 来源——生产实现会给事件加 AgentID 字段（留作作业 3）
+	// 事件通过 AgentID 区分来源，方便并发显示思考和正文。
 	//
 	// 必须在每次 Run 时 fork，而不能在 NewSubAgentTool 时只 fork 一次：同一个
 	// 工具实例会被 executeTools 并发调用，构造期 fork 仍会让所有子代理共享
@@ -78,6 +79,7 @@ func (t *SubAgentTool) Run(ctx context.Context, args json.RawMessage) (string, e
 		model = forker.Fork()
 	}
 	child := &AgentState{
+		AgentID:  fmt.Sprintf("sub-%d", subAgentSequence.Add(1)),
 		Model:    model,
 		Tools:    t.Tools,
 		MaxSteps: t.MaxSteps, // 0 时子 Run 内部回落 DefaultMaxSteps
