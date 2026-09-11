@@ -93,10 +93,9 @@ func (t *SubAgentTool) Run(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	// 提取子 Agent 的最终回答（末条 assistant 消息）
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == llm.RoleAssistant {
-			return msgs[i].Content, nil
-		}
+	out, ok := FinalText(msgs)
+	if !ok {
+		return "", errors.New("delegate_task: sub-agent produced no reply")
 	}
-	return "", errors.New("delegate_task: sub-agent produced no reply")
+	return out, nil
 }

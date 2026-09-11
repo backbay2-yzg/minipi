@@ -70,3 +70,17 @@ func convertToLlm(msgs []Message) []llm.Message {
 	}
 	return out
 }
+
+// FinalText 返回历史中最后一条非空 assistant 文本。
+// 导出原因：组合层（workflow 等）需要提取 Run 的最终回答；
+// SubAgentTool 是第一个使用者，workflow 是第二个。
+// 注意语义收紧：要求 Content 非空——"最终回答"就该非空，
+// 空 assistant（如纯工具调用轮之后异常结束）视为没有回答。
+func FinalText(msgs []Message) (string, bool) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == llm.RoleAssistant && msgs[i].Content != "" {
+			return msgs[i].Content, true
+		}
+	}
+	return "", false
+}

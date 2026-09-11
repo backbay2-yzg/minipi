@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"minipi/internal/session"
+	"minipi/internal/workflow"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"time"
 
@@ -137,8 +139,8 @@ func main() {
 	defer cancel()
 	go printEvents(os.Stdout, ch)
 
-	fmt.Printf("mini-pi day6 | provider=%s model=%s | session=%s\n", provider, model, sess.ID)
-	fmt.Println("输入消息回车发送，运行中可直接输入插话(steer)；/info 会话信息；/list 历史会话；/new 新会话；/quit 退出")
+	fmt.Printf("mini-pi day8 | provider=%s model=%s | session=%s\n", provider, model, sess.ID)
+	fmt.Println("回车发送；运行中可插话(steer)；/chain <主题> 链式工作流；/info /list /new /quit")
 
 	inputCh := make(chan string)
 	go func() {
@@ -175,6 +177,10 @@ func main() {
 				}
 				continue
 			}
+			if strings.HasPrefix(line, "/chain ") {
+				runChainDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/chain")))
+				continue
+			}
 			switch line {
 			case "/quit", "/exit":
 				return
@@ -188,6 +194,9 @@ func main() {
 				}
 				sess = newSession(provider, model, os.Getenv("MINIPI_BASE_URL"), systemPrompt, baseTools)
 				fmt.Println("(new session:", sess.ID+")")
+				continue
+			case "/chain":
+				fmt.Println("用法：/chain <主题>")
 				continue
 			case "/info":
 				fmt.Printf("  session %s | messages %d (%d turns) | usage in=%d out=%d\n",
@@ -259,4 +268,50 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// runChainDemo 演示 Prompt Chaining：提纲 →（门）→ 正文。
+// 同步执行：链运行期间不接受输入（含插话）——已知简化，
+// 异步化 + steering 贯通留作作业 2。
+// bus 用于把链内各环节的流式增量出到订阅者界面；nil 则全程静默。
+func runChainDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, topic string) {
+	outlineRe := regexp.MustCompile(`(?m)^\s*\d+[.、]`)
+
+	chain := []workflow.ChainStep{
+		{
+			Stage: workflow.Stage{
+				Name: "outline",
+				SystemPrompt: "你是提纲编辑。针对给定主题输出一份提纲，" +
+					"每个要点一行，以数字编号开头（如 1.）。不要输出其他内容。",
+			},
+			Gate: func(ctx context.Context, out string) error {
+				if n := len(outlineRe.FindAllString(out, -1)); n < 2 {
+					return fmt.Errorf("提纲仅 %d 个编号要点，至少需要 2 个", n)
+				}
+				return nil
+			},
+			Retries: 1,
+		},
+		{
+			Stage: workflow.Stage{
+				Name: "article",
+				SystemPrompt: "你是技术作者。根据给定提纲撰写一篇短文，" +
+					"逐点展开，总长 300 字以内。",
+			},
+		},
+	}
+
+	res, err := workflow.RunChain(ctx, m, bus, chain, topic)
+	if res != nil && len(res.Outputs) > 0 {
+		fmt.Println("── 提纲 ──")
+		fmt.Println(res.Outputs[0])
+	}
+	if err != nil {
+		fmt.Println("chain error:", err)
+		return
+	}
+	fmt.Println("── 正文 ──")
+	fmt.Println(res.Outputs[1])
+	fmt.Printf("  [chain usage] in=%d out=%d\n",
+		res.TotalUsage.InputTokens, res.TotalUsage.OutputTokens)
 }
