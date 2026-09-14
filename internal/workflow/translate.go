@@ -79,6 +79,7 @@ func TranslateChain(src string) []ChainStep {
 					"使其通顺自然。只输出润色后的译文。",
 			},
 			// Gate 留空：作业 2 在此处外挂人在环门（见 human.go）
+
 		},
 	}
 }

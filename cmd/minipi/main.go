@@ -177,14 +177,11 @@ func main() {
 				}
 				continue
 			}
-			if strings.HasPrefix(line, "/chain ") {
-				runChainDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/chain")))
-				continue
-			}
-			switch line {
-			case "/quit", "/exit":
+
+			switch {
+			case line == "/quit", line == "/exit":
 				return
-			case "/new":
+			case line == "/new":
 				st.Messages = nil
 				st.TotalUsage = llm.TokenUsage{}
 				// 本地历史和 Provider 会话必须一起切换。否则新会话仍会沿用
@@ -195,10 +192,19 @@ func main() {
 				sess = newSession(provider, model, os.Getenv("MINIPI_BASE_URL"), systemPrompt, baseTools)
 				fmt.Println("(new session:", sess.ID+")")
 				continue
-			case "/chain":
+			case line == "/chain":
 				fmt.Println("用法：/chain <主题>")
 				continue
-			case "/info":
+			case strings.HasPrefix(line, "/chain "):
+				runChainDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/chain")))
+				continue
+			case line == "/translate":
+				fmt.Println("用法：/translate <English text>")
+				continue
+			case strings.HasPrefix(line, "/translate "):
+				runTranslateDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/translate")), inputCh)
+				continue
+			case line == "/info":
 				fmt.Printf("  session %s | messages %d (%d turns) | usage in=%d out=%d\n",
 					sess.ID,
 					len(st.Messages),
@@ -206,7 +212,7 @@ func main() {
 					st.TotalUsage.InputTokens,
 					st.TotalUsage.OutputTokens)
 				continue
-			case "/list":
+			case line == "/list":
 				metas, lerr := store.List(ctx)
 				if lerr != nil {
 					fmt.Println("list error:", lerr)
@@ -312,6 +318,29 @@ func runChainDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, topic s
 	}
 	fmt.Println("── 正文 ──")
 	fmt.Println(res.Outputs[1])
+	fmt.Printf("  [chain usage] in=%d out=%d\n",
+		res.TotalUsage.InputTokens, res.TotalUsage.OutputTokens)
+}
+
+// runTranslateDemo 翻译三段链 + 人在环终门。
+// 同步执行（同 runChainDemo）：链运行期间主 goroutine 阻塞在 RunChain 内，
+// 人在环节点因此得以独占 inputCh——所有权契约见 HumanGate 注释。
+// 已知简化：链内 AgentState 未接事件总线（Day 8 选做作业 3 的范围），
+// 人在环门的 say 输出是链运行期间唯一的实时反馈。
+func runTranslateDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, src string, inputCh <-chan string) {
+	steps := workflow.TranslateChain(src)
+	// 终门 = 人在环：润色产物由用户把关；Retries=1 让否决理由驱动重做
+	steps[2].Gate = workflow.HumanGate(inputCh, func(s string) { fmt.Println(s) })
+	steps[2].Retries = 1
+
+	fmt.Println("── 翻译链：翻译 → 审校（残留门）→ 润色（人工终门）──")
+	res, err := workflow.RunChain(ctx, m, bus, steps, src)
+	if err != nil {
+		fmt.Println("chain error:", err)
+		return
+	}
+	fmt.Println("── 终稿 ──")
+	fmt.Println(res.Outputs[2])
 	fmt.Printf("  [chain usage] in=%d out=%d\n",
 		res.TotalUsage.InputTokens, res.TotalUsage.OutputTokens)
 }

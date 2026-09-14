@@ -75,6 +75,10 @@ func RunChain(ctx context.Context, model llm.Model, bus *agent.EventBus, steps [
 // runStep 执行单环节，含门重试循环。返回 (最终输出, 累计 usage, err)。
 // 拒绝路径的输出非空返回——它就是失败现场，调用方要看。
 // stepIdx 用于事件标注环节序号（AgentID 形如 chain-1，界面上可区分环节）。
+// 重试输入三件套：任务（cur）+ 被拒产物（out）+ 拒绝理由（gerr）。
+// "修正"的宾语必须在场：模型看不到上次产物，就无从修正；
+// 人的否决理由几乎总是指涉产物的内容（"结尾太仓促"），产物缺席则反馈失去锚点。
+// 代价：重试输入多出 |out| 的 token —— 受 Retries 上限约束，可接受（编号 84）。
 func runStep(ctx context.Context, model llm.Model, bus *agent.EventBus, stepIdx int, step ChainStep, input string) (string, llm.TokenUsage, error) {
 	var usage llm.TokenUsage
 	cur := input
@@ -110,8 +114,7 @@ func runStep(ctx context.Context, model llm.Model, bus *agent.EventBus, stepIdx 
 				return out, usage, fmt.Errorf("gate rejected after %d attempt(s): %w", attempt+1, gerr)
 			}
 			// 拒绝理由 + 原任务拼进重试输入：模型必须知道错在哪
-			cur = fmt.Sprintf("%s\n\n[上一次输出被拒绝：%v]\n请修正该问题后重新完成任务。",
-				cur, gerr)
+			cur = fmt.Sprintf("%s\n\n[上一次的输出：\n%s\n\n该输出被拒绝：%v]\n请针对拒绝理由修正后重新完成任务。", cur, out, gerr)
 		}
 	}
 }
