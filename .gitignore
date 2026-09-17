@@ -1,0 +1,21 @@
+# 运行产物：SQLite 会话库与 JSON 会话目录
+minipi_sessions.db
+minipi_sessions.db.tmp
+minipi_sessions/
+*.tmp
+
+# 编译产物 / 测试产物
+minipi
+minipi.exe
+*.test
+*.out
+
+# IDE 个人文件。
+# 说明：.idea/.gitignore 已忽略 workspace.xml / dataSources* / shelf/ 等，
+# 这里再显式列一遍属防御性重复（.idea/.gitignore 由 IDE 生成，可能被重写）。
+# 保持入库：.idea/.gitignore、go.imports.xml、minipi.iml、modules.xml、vcs.xml
+.idea/workspace.xml
+.idea/dataSources.xml
+.idea/dataSources.local.xml
+.idea/dataSources/
+.idea/shelf/

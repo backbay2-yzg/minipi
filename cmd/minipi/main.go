@@ -204,6 +204,12 @@ func main() {
 			case strings.HasPrefix(line, "/translate "):
 				runTranslateDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/translate")), inputCh)
 				continue
+			case line == "/route":
+				fmt.Println("用法：/route <问题>")
+				continue
+			case strings.HasPrefix(line, "/route "):
+				runRouteDemo(ctx, m, bus, strings.TrimSpace(strings.TrimPrefix(line, "/route")))
+				continue
 			case line == "/info":
 				fmt.Printf("  session %s | messages %d (%d turns) | usage in=%d out=%d\n",
 					sess.ID,
@@ -343,4 +349,36 @@ func runTranslateDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, src
 	fmt.Println(res.Outputs[2])
 	fmt.Printf("  [chain usage] in=%d out=%d\n",
 		res.TotalUsage.InputTokens, res.TotalUsage.OutputTokens)
+}
+
+// runRouteDemo 路由演示：分类（含理由）→ 按分支执行。
+// bus 下传后分类与派发两个环节的流式增量都能实时出到订阅者界面，
+// 与 runChainDemo 同契约；nil 则全程静默。
+func runRouteDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, q string) {
+	routes := []workflow.Route{
+		{
+			Name:         "tech",
+			Description:  "技术问题：数学计算、时间日期查询",
+			SystemPrompt: "你是技术助手。需要计算或查时间时使用工具，精确作答。",
+			Tools:        agent.NewRegistry(agent.NewCalcTool(), agent.NewTimeTool()),
+		},
+		{
+			Name:         "translate",
+			Description:  "中英互译请求",
+			SystemPrompt: "你是专业译者，只输出译文。",
+		},
+		{
+			Name:         "chat",
+			Description:  "闲聊、寒暄、开放式谈话",
+			SystemPrompt: "你是轻松友善的聊天伙伴，回答简短。",
+		},
+	}
+	res, err := workflow.RunRoute(ctx, m, bus, routes, q, 1)
+	if err != nil {
+		fmt.Println("route error:", err)
+		return
+	}
+	fmt.Printf(" [route] %s — %s\n", res.Route, res.Reason)
+	fmt.Println(res.Output)
+	fmt.Printf(" [route usage] in=%d out=%d\n", res.Usage.InputTokens, res.Usage.OutputTokens)
 }
