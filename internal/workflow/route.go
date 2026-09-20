@@ -11,28 +11,41 @@ import (
 	"strings"
 )
 
-// Route 是一条候选分支：分类器按 Description 选路，
-// 命中后以 SystemPrompt + Tools 执行原始任务。
+// Route 是一条候选分支：分类器按 Description 选路。两种形态二选一：
+//   - 简单分支：SystemPrompt（+ 可选 Tools）→ 单次 Run
+//   - 链分支：Chain 非空 → RunChain，各环节自带 Stage
+//
+// 同时设置两者 = 歧义配置，runRoute 显式报错（反模式 88 的防线）。
 type Route struct {
 	Name         string
-	Description  string // 给分类器看的分支画像
-	SystemPrompt string
-	Tools        *agent.Registry // nil = 纯文本分支
+	Description  string          // 给分类器看的分支画像
+	SystemPrompt string          // 简单分支：单次 Run 的 system（与 Chain 互斥）
+	Tools        *agent.Registry // 简单分支工具（nil = 纯文本）
+	Chain        []ChainStep     // 链分支：非空时按 RunChain 执行（与 SystemPrompt 互斥）
 }
 
 // RouteResult 路由执行结果。Route/Reason 必须返回：
 // 路由决策本身是核心可观测数据——"选错路"是最隐蔽的失败形态，
 // 没有决策记录的路由是 debug 黑洞。
 type RouteResult struct {
-	Route  string
-	Reason string
-	Output string
-	Usage  llm.TokenUsage // 分类 + 执行累计
+	Route      string
+	Reason     string
+	Confidence float64 // 分类置信度；模型未给 = 0；低置信落兜底时保留原值
+	Output     string
+	Usage      llm.TokenUsage // 分类 + 执行（链含全部环节与重试）累计
+}
+
+// FallbackPolicy 兜底策略。零值 = fail-loud（Day 9 原语义）。
+type FallbackPolicy struct {
+	Route         string  // 兜底分支名，必须存在于 routes；"" = 不启用
+	MinConfidence float64 // 置信度阈值 (0,1]，低于它落兜底；0 = 不检查
+	// 模型漏给 confidence 按零值 0 处理 → 低于任何阈值 → 保守落兜底
 }
 
 type routeDecision struct {
-	Route  string `json:"route"`
-	Reason string `json:"reason"`
+	Route      string  `json:"route"`
+	Reason     string  `json:"reason"`
+	Confidence float64 `json:"confidence"`
 }
 
 // fenceRe 匹配 markdown 代码围栏内容（(?s) 让 . 匹配换行）
@@ -108,7 +121,23 @@ func firstRunesOf(s string, n int) string {
 	return s
 }
 
-// RunRoute 路由：一次轻量分类（结构化门 + 重试）+ 按命中分支执行原始任务。
+// RunRoute fail-loud 路由（Day 9 原语义：未知分支/解析失败即报错）。
+func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes []Route, input string, retries int) (*RouteResult, error) {
+	return runRoute(ctx, model, bus, routes, input, routePolicy{Retries: retries})
+}
+
+// RunRouteWithFallback 带兜底的路由：分类语义失败或置信度不足时
+// 落指定分支而非报错。模型级错误照常上抛（见 FallbackPolicy 注释）。
+func RunRouteWithFallback(ctx context.Context, model llm.Model, bus *agent.EventBus, routes []Route, input string, retries int, fb FallbackPolicy) (*RouteResult, error) {
+	return runRoute(ctx, model, bus, routes, input, routePolicy{Retries: retries, Fallback: fb})
+}
+
+type routePolicy struct {
+	Retries  int
+	Fallback FallbackPolicy // 零值 = fail-loud
+}
+
+// runRoute 路由：一次轻量分类（结构化门 + 重试）+ 按命中分支执行原始任务。
 //
 // 设计要点：
 //   - 分类环节复用 runStep：门 = “输出可解析且分支名已知”，拒绝后
@@ -120,19 +149,19 @@ func firstRunesOf(s string, n int) string {
 //   - 分类与执行的 usage 都入账（Day 6 反模式 53 的路由版）
 //   - bus 可为 nil（静默）。非 nil 时把总线下传给分类与派发两个环节，
 //     与 RunChain 同契约：路由是数据管道，不该屏蔽过程
-func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes []Route, input string, retries int) (*RouteResult, error) {
+func runRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes []Route, input string, p routePolicy) (*RouteResult, error) {
 	if model == nil {
 		return nil, errors.New("workflow: nil model")
 	}
 	if len(routes) == 0 {
 		return nil, errors.New("workflow: no routes")
 	}
-	// 分支表校验前置：空名 / 重名都是启动期配置错误，快速失败（与 Registry.Register 同型）。
-	// ★ byName 是校验与查找的【唯一真相】：门用它的键判"分支名已知"，
-	// 派发用它的值取分支——两者同源 ⇒ 门通过后 byName[dec.Route] 必然存在，
-	// 派发环节因此无需再"找一遍"，也不可能拿到 nil。
+
+	// 分支表校验前置：空名 / 重名 / 歧义配置都是启动期编程错误，快速失败
+	// （与 Registry.Register 同型）。★ byName 是校验与查找的【唯一真相】：
+	// 门用它的键判"分支名已知"，派发用它的值取分支——两者同源 ⇒ 门通过后
+	// byName[dec.Route] 必然存在，派发因此无需线性查找，也拿不到 nil。
 	byName := make(map[string]*Route, len(routes))
-	names := make(map[string]bool, len(routes))
 	for i := range routes {
 		r := &routes[i]
 		if r.Name == "" {
@@ -141,10 +170,28 @@ func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes 
 		if _, dup := byName[r.Name]; dup {
 			return nil, fmt.Errorf("workflow: duplicate route %q", r.Name)
 		}
+		if r.SystemPrompt != "" && len(r.Chain) > 0 {
+			return nil, fmt.Errorf("workflow: route %q: SystemPrompt 与 Chain 互斥，二选一", r.Name)
+		}
 		byName[r.Name] = r
-		names[r.Name] = true
 	}
-
+	// names 供 parseRouteDecision 的 map[string]bool 签名使用；由 byName
+	// 现构而非并行维护，杜绝"两张表不同步"的整类 bug。
+	names := make(map[string]bool, len(byName))
+	for n := range byName {
+		names[n] = true
+	}
+	fb := p.Fallback
+	if fb.Route != "" {
+		if !names[fb.Route] {
+			return nil, fmt.Errorf("workflow: fallback route %q not in routes", fb.Route)
+		}
+		if fb.MinConfidence > 1 {
+			return nil, fmt.Errorf("workflow: MinConfidence %v 超出 (0,1]", fb.MinConfidence)
+		}
+	} else if fb.MinConfidence > 0 {
+		return nil, errors.New("workflow: FallbackPolicy.MinConfidence 需要同时设置 Route")
+	}
 	// 分类 = 无工具 Stage + 结构化门；门拒绝 → 带理由重试（复用 runStep）。
 	// stepIdx 传 -1：分类不是链上环节，但事件仍需带 AgentID 以便界面区分来源。
 	out, usage, err := runStep(ctx, model, bus, -1, ChainStep{
@@ -153,9 +200,17 @@ func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes 
 			_, gerr := parseRouteDecision(output, names)
 			return gerr
 		},
-		Retries: retries,
+		Retries: p.Retries,
 	}, input)
 	if err != nil {
+		// 兜底只接管"分类语义失败"（门耗尽 = 输入歧义/输出垃圾）；
+		// 模型级错误照常上抛——兜底分支用同一个模型，救不了也不该救（反模式 89）
+		if fb.Route != "" && errors.Is(err, ErrGateRejected) {
+			return dispatch(ctx, model, bus, byName, routeDecision{
+				Route:  fb.Route,
+				Reason: "分类未果（不可解析或分支未知），已落兜底",
+			}, usage, input)
+		}
 		return nil, fmt.Errorf("workflow: classify: %w", err)
 	}
 
@@ -164,22 +219,56 @@ func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes 
 	if perr != nil {
 		return nil, fmt.Errorf("workflow: classify: %w", perr)
 	}
+	// 低置信度 → 直接落兜底，不重试：歧义在输入不在分类器，
+	// 重试烧 token 换不来确定性（反模式 90）
+	if fb.Route != "" && fb.MinConfidence > 0 && dec.Confidence < fb.MinConfidence {
+		dec = routeDecision{
+			Route:      fb.Route,
+			Reason:     fmt.Sprintf("置信度 %.2f 低于阈值 %.2f，落兜底", dec.Confidence, fb.MinConfidence),
+			Confidence: dec.Confidence,
+		}
+	}
+	return dispatch(ctx, model, bus, byName, dec, usage, input)
+}
 
-	// 派发：命中分支执行【原始输入】。
-	// hit 理论上必存在（见 byName 注释），但这是跨函数推理出的不变量——
-	// 显式判空把"不可能"变成"不会崩"：将来若门被放宽，这里返回可诊断的
-	// error 而不是给调用方一个 nil 解引用 panic（反模式 66 精神）。
+// dispatch 按命中分支执行【原始任务】：链分支走 RunChain，简单分支单次 Run。
+// 这就是作业 1 要体会的"模式的模式"：路由派发只是一个 switch——
+// 一侧是单次 Run，一侧是整条链；而链内的 runStep 又复用门机制。
+// 组合的深度来自机制的少，不来自机制的多。
+// byName 由 runRoute 传入，与门校验同源 ⇒ 查找必命中。
+func dispatch(ctx context.Context, model llm.Model, bus *agent.EventBus, byName map[string]*Route, dec routeDecision, usage llm.TokenUsage, input string) (*RouteResult, error) {
 	hit, ok := byName[dec.Route]
-	if !ok {
-		return nil, fmt.Errorf("workflow: route %q 不在分支表中（分类器与分支表漂移？）", dec.Route)
+	if !ok { // dec.Route 经门或兜底校验，理论不可达；防御性保留
+		return nil, fmt.Errorf("workflow: internal: route %q vanished", dec.Route)
 	}
-	st := &agent.AgentState{
-		AgentID:      "route-1",
-		Model:        model,
-		SystemPrompt: hit.SystemPrompt,
-		Tools:        hit.Tools,
-		Bus:          bus, // nil = 静默；非 nil = 派发环节的 delta 实时出流
+
+	// 链分支：输入仍是【原始任务】（反模式 81 同律）；
+	// usage 从 ChainResult 贯通到 RouteResult（含链内全部环节与重试）
+	if len(hit.Chain) > 0 {
+		cres, cerr := RunChain(ctx, model, bus, hit.Chain, input)
+		if cres != nil {
+			usage.InputTokens += cres.TotalUsage.InputTokens
+			usage.OutputTokens += cres.TotalUsage.OutputTokens
+		}
+		if cerr != nil {
+			return nil, fmt.Errorf("workflow: route %q: %w", dec.Route, cerr)
+		}
+		// 防御性守卫：RunChain 只在 out != "" 时 append，故 Outputs 为空时
+		// 这里的 [len-1] 会 panic。当前不可达——产出空串的环节必然带回
+		// err（runStep 的 "stage produced no final text"），已在上面 return；
+		// 但这份保证依赖 RunChain 的内部实现，一旦它改成"空产出也算成功"
+		// （如允许跳过环节），守卫就从冗余变成必需。宁可留一行，不要留 panic。
+		if len(cres.Outputs) == 0 {
+			return nil, fmt.Errorf("workflow: route %q chain produced no output", dec.Route)
+		}
+		return &RouteResult{
+			Route: dec.Route, Reason: dec.Reason, Confidence: dec.Confidence,
+			Output: cres.Outputs[len(cres.Outputs)-1], Usage: usage,
+		}, nil
 	}
+
+	// 简单分支
+	st := &agent.AgentState{Model: model, SystemPrompt: hit.SystemPrompt, Tools: hit.Tools}
 	msgs, rerr := agent.Run(ctx, st, input)
 	usage.InputTokens += st.TotalUsage.InputTokens
 	usage.OutputTokens += st.TotalUsage.OutputTokens
@@ -190,6 +279,11 @@ func RunRoute(ctx context.Context, model llm.Model, bus *agent.EventBus, routes 
 	if !ok {
 		return nil, fmt.Errorf("workflow: route %q produced no final text", dec.Route)
 	}
-
-	return &RouteResult{Route: dec.Route, Reason: dec.Reason, Output: final, Usage: usage}, nil
+	return &RouteResult{
+		Route:      dec.Route,
+		Reason:     dec.Reason,
+		Confidence: dec.Confidence,
+		Output:     final,
+		Usage:      usage,
+	}, nil
 }

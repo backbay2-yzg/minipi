@@ -351,9 +351,10 @@ func runTranslateDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, src
 		res.TotalUsage.InputTokens, res.TotalUsage.OutputTokens)
 }
 
-// runRouteDemo 路由演示：分类（含理由）→ 按分支执行。
-// bus 下传后分类与派发两个环节的流式增量都能实时出到订阅者界面，
-// 与 runChainDemo 同契约；nil 则全程静默。
+// runRouteDemo 路由演示：分类（含置信度）→ 按分支执行，含链分支与兜底。
+// 路由表按查询现构：翻译分支是链分支，TranslateChain(q) 要烘焙原文——
+// 输入依赖的链没有静态形态，表随查询重建是正道不是妥协。
+// 已知简化：workflow 层未接事件总线（Day 8 选做 3 的范围），无流式输出。
 func runRouteDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, q string) {
 	routes := []workflow.Route{
 		{
@@ -363,9 +364,9 @@ func runRouteDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, q strin
 			Tools:        agent.NewRegistry(agent.NewCalcTool(), agent.NewTimeTool()),
 		},
 		{
-			Name:         "translate",
-			Description:  "中英互译请求",
-			SystemPrompt: "你是专业译者，只输出译文。",
+			Name:        "translate",
+			Description: "中英互译：输入为英文段落时翻译成中文",
+			Chain:       workflow.TranslateChain(q),
 		},
 		{
 			Name:         "chat",
@@ -373,12 +374,13 @@ func runRouteDemo(ctx context.Context, m llm.Model, bus *agent.EventBus, q strin
 			SystemPrompt: "你是轻松友善的聊天伙伴，回答简短。",
 		},
 	}
-	res, err := workflow.RunRoute(ctx, m, bus, routes, q, 1)
+	res, err := workflow.RunRouteWithFallback(ctx, m, bus, routes, q, 1,
+		workflow.FallbackPolicy{Route: "chat", MinConfidence: 0.7})
 	if err != nil {
 		fmt.Println("route error:", err)
 		return
 	}
-	fmt.Printf(" [route] %s — %s\n", res.Route, res.Reason)
+	fmt.Printf("  [route] %s — %s (conf %.2f)\n", res.Route, res.Reason, res.Confidence)
 	fmt.Println(res.Output)
-	fmt.Printf(" [route usage] in=%d out=%d\n", res.Usage.InputTokens, res.Usage.OutputTokens)
+	fmt.Printf("  [route usage] in=%d out=%d\n", res.Usage.InputTokens, res.Usage.OutputTokens)
 }

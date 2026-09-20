@@ -8,6 +8,11 @@ import (
 	"minipi/internal/llm"
 )
 
+// ErrGateRejected 门重试耗尽仍被拒的哨兵。调用方以 errors.Is 区分
+// "门语义失败"（产物不合格/不可解析——可兜底、可换路）与模型级错误
+// （网络/取消——必须上抛）。需要 Go 1.20+（双重 %w）。
+var ErrGateRejected = errors.New("gate rejected")
+
 // Stage 是链的一个环节：独立的 SystemPrompt 与工具集。
 // 独立性的意义：每个环节是"一个专才"——提纲编辑不该背着写作工具，
 // 翻译者不该带着审校者的 system。混装 = 环节互相污染。
@@ -111,8 +116,9 @@ func runStep(ctx context.Context, model llm.Model, bus *agent.EventBus, stepIdx 
 			return out, usage, nil
 		} else {
 			if attempt >= step.Retries {
-				return out, usage, fmt.Errorf("gate rejected after %d attempt(s): %w", attempt+1, gerr)
+				return out, usage, fmt.Errorf("%w after %d attempt(s): %w", ErrGateRejected, attempt+1, gerr)
 			}
+
 			// 拒绝理由 + 原任务拼进重试输入：模型必须知道错在哪
 			cur = fmt.Sprintf("%s\n\n[上一次的输出：\n%s\n\n该输出被拒绝：%v]\n请针对拒绝理由修正后重新完成任务。", cur, out, gerr)
 		}
